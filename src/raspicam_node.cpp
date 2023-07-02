@@ -37,7 +37,7 @@ int main(int argc, char** argv) {
 
 #endif  // __x86_64__
 
-#if defined(__arm__) || defined(__aarch64__)
+// #if defined(__arm__) || defined(__aarch64__)
 
 // We use some GNU extensions (basename)
 #include <memory.h>
@@ -167,6 +167,73 @@ sensor_msgs::CameraInfo c_info;
 std::string camera_frame_id;
 int skip_frames = 0;
 
+void trigger_callback(const std_msgs::Empty &trigger, RASPIVID_STATE& state) {
+  ROS_INFO("Camera triggered");
+  
+  if (mmal_port_parameter_set_boolean(camera_still_port, MMAL_PARAMETER_CAPTURE, 1) != MMAL_SUCCESS) {
+    return 1;
+  }
+
+  MMAL_PORT_T* camera_still_port = state.camera_component->output[mmal::camera_port::capture];
+  MMAL_PORT_T* image_encoder_output_port = state.image_encoder_component->output[0];
+  MMAL_PORT_T* video_encoder_output_port = state.video_encoder_component->output[0];
+  MMAL_PORT_T* splitter_output_raw = state.splitter_component->output[1];
+  // Send all the buffers to the image encoder output port
+  {
+    int num = mmal_queue_length(state.image_encoder_pool->queue);
+    int q;
+    for (q = 0; q < num; q++) {
+      MMAL_BUFFER_HEADER_T* buffer = mmal_queue_get(state.image_encoder_pool->queue);
+
+      if (!buffer) {
+        vcos_log_error("Unable to get a required buffer %d from pool queue", q);
+        ROS_ERROR("Unable to get a required buffer %d from pool queue", q);
+      }
+
+      if (mmal_port_send_buffer(image_encoder_output_port, buffer) != MMAL_SUCCESS) {
+        vcos_log_error("Unable to send a buffer to image encoder output port (%d)", q);
+        ROS_ERROR("Unable to send a buffer to image encoder output port (%d)", q);
+      }
+    }
+  }
+  // Send all the buffers to the video encoder output port
+  if (state.enable_imv_pub) {
+    int num = mmal_queue_length(state.video_encoder_pool->queue);
+    int q;
+    for (q = 0; q < num; q++) {
+      MMAL_BUFFER_HEADER_T* buffer = mmal_queue_get(state.video_encoder_pool->queue);
+
+      if (!buffer) {
+        vcos_log_error("Unable to get a required buffer %d from pool queue", q);
+        ROS_ERROR("Unable to get a required buffer %d from pool queue", q);
+      }
+
+      if (mmal_port_send_buffer(video_encoder_output_port, buffer) != MMAL_SUCCESS) {
+        vcos_log_error("Unable to send a buffer to video encoder output port (%d)", q);
+        ROS_ERROR("Unable to send a buffer to video encoder output port (%d)", q);
+      }
+    }
+  }
+  // Send all the buffers to the splitter output port
+  if (state.enable_raw_pub) {
+    int num = mmal_queue_length(state.splitter_pool->queue);
+    int q;
+    for (q = 0; q < num; q++) {
+      MMAL_BUFFER_HEADER_T* buffer = mmal_queue_get(state.splitter_pool->queue);
+
+      if (!buffer) {
+        vcos_log_error("Unable to get a required buffer %d from pool queue", q);
+        ROS_ERROR("Unable to get a required buffer %d from pool queue", q);
+      }
+
+      if (mmal_port_send_buffer(splitter_output_raw, buffer) != MMAL_SUCCESS) {
+        vcos_log_error("Unable to send a buffer to splitter output port (%d)", q);
+        ROS_ERROR("Unable to send a buffer to splitter output port (%d)", q);
+      }
+    }
+  }
+}
+
 /**
  * Assign a default set of parameters to the state passed in
  *
@@ -256,7 +323,7 @@ static void image_encoder_buffer_callback(MMAL_PORT_T* port, MMAL_BUFFER_HEADER_
 
           compressed_image.msg.header.seq = pData->frame;
           compressed_image.msg.header.frame_id = camera_frame_id;
-          compressed_image.msg.header.stamp = ros::Time::now();
+          compressed_image.msg.header.stamp = ros::Time::now(); // Let's check if there can be dublicates
           compressed_image.msg.format = "jpeg";
           auto start = pData->buffer[pData->frame & 1].get();
           auto end = &(pData->buffer[pData->frame & 1].get()[pData->id]);
@@ -398,7 +465,7 @@ static void splitter_buffer_callback(MMAL_PORT_T* port, MMAL_BUFFER_HEADER_T* bu
     }
 
     int complete = false;
-    if (buffer->flags & (MMAL_BUFFER_HEADER_FLAG_FRAME_END | MMAL_BUFFER_HEADER_FLAG_TRANSMISSION_FAILED))
+    if (buffer->flags & (MMAL_BUFFER_HEADER_FLAG_FRAME_END | MMAL_BUFFER_HEADER_FLAG_TRANSMISSION_FAILED)) // Why it also accept the failure?
       complete = true;
 
     if (complete) {
@@ -410,7 +477,7 @@ static void splitter_buffer_callback(MMAL_PORT_T* port, MMAL_BUFFER_HEADER_T* bu
           pData->frames_skipped = 0;
           image.msg.header.seq = pData->frame;
           image.msg.header.frame_id = camera_frame_id;
-          image.msg.header.stamp = c_info.header.stamp;
+          image.msg.header.stamp = ros::Time::now(); // TODO: why this is the case? why from a camera_info? Let's set ros::Time::now()
           image.msg.encoding = "bgr8";
           image.msg.is_bigendian = false;
           image.msg.height = pData->pstate.height;
@@ -418,7 +485,7 @@ static void splitter_buffer_callback(MMAL_PORT_T* port, MMAL_BUFFER_HEADER_T* bu
           image.msg.step = (pData->pstate.width * 3);
           auto start = pData->buffer[pData->frame & 1].get();
           auto end = &(pData->buffer[pData->frame & 1].get()[pData->id]);
-          image.msg.data.resize(pData->id);
+          image.msg.data.resize(pData->id); // Is it just for the good measure?
           std::copy(start, end, image.msg.data.begin());
           image.pub->publish(image.msg);
         }
@@ -1208,6 +1275,18 @@ int start_capture(RASPIVID_STATE& state) {
   return 0;
 }
 
+int init_capture(RASPIVID_STATE& state) {
+  if (!(state.isInit))
+    ROS_FATAL("Tried to start capture before camera is inited");
+
+  MMAL_PORT_T* camera_video_port = state.camera_component->output[mmal::camera_port::video];
+  MMAL_PORT_T* image_encoder_output_port = state.image_encoder_component->output[0];
+  MMAL_PORT_T* video_encoder_output_port = state.video_encoder_component->output[0];
+  MMAL_PORT_T* splitter_output_raw = state.splitter_component->output[1];
+  ROS_INFO("Starting video capture (%d, %d, %d, %d)\n", state.width, state.height, state.quality, state.framerate);
+  return 0;
+}
+
 int close_cam(RASPIVID_STATE& state) {
   if (state.isInit) {
     state.isInit = false;
@@ -1345,8 +1424,6 @@ int main(int argc, char** argv) {
     ROS_INFO("Camera successfully calibrated from device specifc file");
   }
 
-  
-
   // diagnostics parameters
   state_srv.updater.setHardwareID("raspicam");
   double desired_freq = state_srv.framerate;
@@ -1374,10 +1451,14 @@ int main(int argc, char** argv) {
   f = boost::bind(&reconfigure_callback, _1, _2, boost::ref(state_srv));
   server.setCallback(f);
 
-  start_capture(state_srv);
+  ros::Subscriber sub = nh_params.subscribe<std_msgs::Empty>("/imu/tick", 1000,
+    boost::bind(&trigger_callback, _1, boost::ref(state_srv)));
+
+  // start_capture(state_srv);
+  init_capture(state_srv);
   ros::spin();
   close_cam(state_srv);
   ros::shutdown();
 }
 
-#endif  // __arm__ || __aarch64__
+// #endif  // __arm__ || __aarch64__
